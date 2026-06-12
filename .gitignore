@@ -1,6 +1,7 @@
 # PyInstaller
 build/
-dist/
+dist/*
+!dist/CodexUsage.exe
 *.spec
 
 # Python
