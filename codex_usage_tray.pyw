@@ -20,11 +20,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import pystray
 
 AUTH_PATH = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
 CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "CodexUsage" / "config.json"
+APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+ICON_PATH = APP_ROOT / "img" / "icon.jpg"
 USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI 的官方 OAuth client id
@@ -167,16 +169,31 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-def render_icon(text, color):
+def render_fallback_icon(status_color):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, 63, 63], radius=14, fill=color)
-    font = load_font(40 if len(text) <= 2 else 30)
-    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
-    d.text(
-        ((64 - (right - left)) / 2 - left, (64 - (bottom - top)) / 2 - top),
-        text, font=font, fill="white",
-    )
+    d.rounded_rectangle([0, 0, 63, 63], radius=14, fill="#101014")
+    d.rounded_rectangle([1, 1, 62, 62], radius=13, outline="#33333c", width=2)
+
+    # Codex-style mark: a compact code chevron plus cursor on a dark tile.
+    d.line([(34, 17), (21, 32), (34, 47)], fill="#f4f4f5", width=6, joint="curve")
+    d.line([(43, 22), (51, 32), (43, 42)], fill="#f4f4f5", width=5, joint="curve")
+    d.rounded_rectangle([33, 43, 49, 48], radius=2, fill="#f4f4f5")
+
+    d.ellipse([45, 45, 62, 62], fill="#101014")
+    d.ellipse([48, 48, 60, 60], fill=status_color)
+    return img
+
+
+def render_icon(status_color):
+    try:
+        img = Image.open(ICON_PATH).convert("RGBA").resize((64, 64), Image.LANCZOS)
+    except OSError:
+        return render_fallback_icon(status_color)
+
+    d = ImageDraw.Draw(img)
+    d.ellipse([45, 45, 62, 62], fill=(16, 16, 20, 255))
+    d.ellipse([48, 48, 60, 60], fill=status_color)
     return img
 
 
@@ -185,12 +202,12 @@ def fmt_pct(v):
 
 
 def win_label(secs, fallback):
-    """把窗口長度轉成顯示標籤：18000→5h、604800→7d、2592000→30d。"""
+    """把窗口長度轉成短標籤：session→S、weekly→W。"""
     if not secs:
         return fallback
     if secs < 48 * 3600:
-        return f"{secs / 3600:.0f}h"
-    return f"{secs / 86400:.0f}d"
+        return "S"
+    return "W"
 
 
 def fmt_reset(dt, with_date=False):
@@ -254,10 +271,7 @@ def update_once(icon):
     with state_lock:
         if state["ok"] or is_fresh():
             # 暫時抓不到新資料時沿用最後一次成功的數字，避免一直閃問號
-            icon.icon = render_icon(
-                f"{state['session']:.0f}" if state["session"] is not None else "?",
-                pick_color(state["session"], state["weekly"]),
-            )
+            icon.icon = render_icon(pick_color(state["session"], state["weekly"]))
             parts = []
             for pct, reset, win in (
                 (state["session"], state["session_reset"], state["session_win"]),
@@ -269,7 +283,7 @@ def update_once(icon):
             icon.title = ("Codex 用量  " + " | ".join(parts)
                           + ("" if state["ok"] else "（暫停更新）"))
         else:
-            icon.icon = render_icon("?", COLOR_STALE)
+            icon.icon = render_icon(COLOR_STALE)
             icon.title = f"Codex 用量：{state['error']}"
     icon.update_menu()
 
@@ -323,17 +337,33 @@ class Overlay:
         self.root = tk.Tk()
         self.root.overrideredirect(True)        # 無邊框、不出現在工作列
         self.root.attributes("-topmost", True)  # 永遠置頂
-        self.root.attributes("-alpha", 0.88)
+        self.root.attributes("-alpha", 0.92)
+        self.frame = tk.Frame(self.root, bg=COLOR_STALE)
+        self.frame.pack()
+
+        self.logo_image = None
+        self.logo = None
+        try:
+            logo = Image.open(ICON_PATH).convert("RGBA").resize((18, 18), Image.LANCZOS)
+            self.logo_image = ImageTk.PhotoImage(logo)
+            self.logo = tk.Label(self.frame, image=self.logo_image, bg=COLOR_STALE, bd=0)
+            self.logo.pack(side="left", padx=(3, 2), pady=4)
+        except OSError:
+            pass
+
         self.label = tk.Label(
-            self.root, text="Codex …", fg="white", bg=COLOR_STALE,
-            font=("Segoe UI", 11, "bold"), padx=10, pady=4,
+            self.frame, text="?", fg="white", bg=COLOR_STALE,
+            font=("Segoe UI", 11, "bold"), padx=2, pady=4,
         )
-        self.label.pack()
+        self.label.pack(side="left", padx=(0, 3))
         self._drag = None
-        self.label.bind("<ButtonPress-1>", self._drag_start)
-        self.label.bind("<B1-Motion>", self._drag_move)
-        self.label.bind("<ButtonRelease-1>", self._drag_end)
-        self.label.bind("<Button-3>", self._hide)  # 右鍵：隱藏（可從系統匣選單再開）
+        for widget in (self.frame, self.logo, self.label):
+            if widget is None:
+                continue
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<ButtonRelease-1>", self._drag_end)
+            widget.bind("<Button-3>", self._hide)  # 右鍵：隱藏（可從系統匣選單再開）
 
         self.root.update_idletasks()
         if config["x"] is not None and config["y"] is not None:
@@ -373,14 +403,17 @@ class Overlay:
                                  (state["weekly"], state["weekly_win"])):
                     if pct is not None or win is not None:
                         segs.append(f"{win_label(win, '?')} {fmt_pct(pct)}")
-                text = "   ".join(segs) or "Codex ?"
+                text = "   ".join(segs) or "?"
                 if not state["ok"]:
                     text += " *"  # 星號＝顯示的是最後一次成功的數字
                 color = pick_color(state["session"], state["weekly"])
             else:
-                text = "Codex ?"
+                text = "?"
                 color = COLOR_STALE
+        self.frame.config(bg=color)
         self.label.config(text=text, bg=color)
+        if self.logo is not None:
+            self.logo.config(bg=color)
         if config["overlay"]:
             self.root.deiconify()
         else:
@@ -396,7 +429,7 @@ def main():
     load_config()
     icon = pystray.Icon(
         "CodexUsage",
-        icon=render_icon("…", COLOR_STALE),
+        icon=render_icon(COLOR_STALE),
         title="Codex 用量：載入中",
         menu=pystray.Menu(
             pystray.MenuItem(menu_session, None, enabled=False),
